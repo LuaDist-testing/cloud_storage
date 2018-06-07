@@ -1,17 +1,17 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "cloud_storage"
-version = "0.1.0-1"
+version = "1.0.0-1"
 
 -- LuaDist source
 source = {
-  tag = "0.1.0-1",
+  tag = "1.0.0-1",
   url = "git://github.com/LuaDist-testing/cloud_storage.git"
 }
 -- Original source
 -- source = {
 --   url = "git://github.com/leafo/cloud_storage.git",
---   branch = "v0.1.0",
+-- 	branch = "v1.0.0"
 -- }
 
 description = {
@@ -25,7 +25,7 @@ dependencies = {
   "luasocket",
   "lua-cjson",
   "mimetypes",
-  "luacrypto",
+  "luaossl",
   "date",
   "luaexpat",
 }
@@ -33,9 +33,9 @@ dependencies = {
 build = {
   type = "builtin",
   modules = {
-    ["cloud_storage.mock"] = "cloud_storage/mock.lua",
-    ["cloud_storage.google"] = "cloud_storage/google.lua",
-    ["cloud_storage.oauth"] = "cloud_storage/oauth.lua",
-    ["cloud_storage.http"] = "cloud_storage/http.lua",
+		["cloud_storage.google"] = "cloud_storage/google.lua",
+		["cloud_storage.http"] = "cloud_storage/http.lua",
+		["cloud_storage.mock"] = "cloud_storage/mock.lua",
+		["cloud_storage.oauth"] = "cloud_storage/oauth.lua",
   }
 }

@@ -11,11 +11,35 @@ h = require "cloud_storage.http"
 
 import insert, concat from table
 
+url_encode_key = (key) ->
+  (key\gsub [==[[%[%]#!%^%*%(%)"'%%]]==], (c) ->
+    "%#{"%x"\format(c\byte!)\upper!}")
+
 extend = (t, ...) ->
   for other in *{...}
     if other != nil
       t[k] = v for k,v in pairs other
   t
+
+xml_escape = do
+  punct = "[%^$()%.%[%]*+%-?]"
+  escape_patt = (str) -> (str\gsub punct, (p) -> "%"..p)
+
+  xml_escape_entities = {
+    ['&']: '&amp;'
+    ['<']: '&lt;'
+    ['>']: '&gt;'
+    ['"']: '&quot;'
+    ["'"]: '&#039;'
+  }
+
+  xml_unescape_entities = {}
+  for key,value in pairs xml_escape_entities
+    xml_unescape_entities[value] = key
+
+  xml_escape_pattern = "[" .. concat([escape_patt char for char in pairs xml_escape_entities]) .. "]"
+
+  (text) -> (text\gsub xml_escape_pattern, xml_escape_entities)
 
 class LOMFormatter
   find_node = (node, tag) ->
@@ -95,6 +119,18 @@ class Bucket
 
 class CloudStorage
   url_base: "commondatastorage.googleapis.com"
+  api_base: "storage.googleapis.com"
+
+  @from_json_key_file: (file) =>
+    file_contents = assert assert(io.open(file))\read "*a"
+    json = require("cjson")
+    obj = assert json.decode file_contents
+    import OAuth from require "cloud_storage.oauth"
+
+    oauth = OAuth obj.client_email
+    oauth\_load_private_key obj.private_key
+
+    CloudStorage oauth, obj.client_id
 
   new: (@oauth, @project_id) =>
     @formatter = LOMFormatter!
@@ -106,24 +142,25 @@ class CloudStorage
       "Authorization": "OAuth #{@oauth\get_access_token!}"
       "Date": date!\fmt "${http}"
     }
-  
+
   _request: (method="GET", path, data, headers) =>
     http = h.get!
 
     out = {}
     r = {
-      url: url.build {
-        scheme: "https"
-        host: "storage.googleapis.com"
-        path: path
-      }
+      url: "https://#{@api_base}#{path}"
       source: data and ltn12.source.string data
       method: method
       headers: extend @_headers!, headers
       sink: ltn12.sink.table out
     }
     _, code, res_headers = http.request r
-    @formatter\format table.concat(out), code, res_headers
+    res, code = @formatter\format table.concat(out), code, res_headers
+
+    if type(res) == "table" and res.error
+      nil, "#{res.message} #{res.details}", res
+    else
+      res, code
 
   bucket: (bucket) => Bucket bucket, @
 
@@ -142,20 +179,26 @@ class CloudStorage
 
   get_service: => @_get "/"
   get_bucket: (bucket) => @_get "/#{bucket}"
-  get_file: (bucket, key) => @_get "/#{bucket}/#{key}"
-  delete_file: (bucket, key) => @_delete "/#{bucket}/#{key}"
-  head_file: (bucket, key) => @_head "/#{bucket}/#{key}"
+  get_file: (bucket, key) => @_get "/#{bucket}/#{url.escape key}"
+  delete_file: (bucket, key) => @_delete "/#{bucket}/#{url.escape key}"
+  head_file: (bucket, key) => @_head "/#{bucket}/#{url.escape key}"
 
   -- sets predefined acl
   put_file_acl: (bucket, key, acl) =>
-    error "broken"
-    @_put "/#{bucket}/#{key}?acl", "", {
+    @_put "/#{bucket}/#{url.escape key}?acl", "", {
       "Content-length": 0
       "x-goog-acl": acl
     }
 
-  put_file_string: (bucket, data, options={}) =>
-    @_put "/#{bucket}/#{options.key}", data, extend {
+  put_file_string: (bucket, key, data, options={}) =>
+    assert not options.key, "key is not an option, but an argument"
+    if type(data) == "table"
+      error "put_file_string interface has changed: key is now the second argument"
+
+    assert key, "missing key"
+    assert type(data) == "string", "expected string for data"
+
+    @_put "/#{bucket}/#{key}", data, extend {
       "Content-length": #data
       "Content-type": options.mimetype
       "x-goog-acl": options.acl or "public-read"
@@ -169,8 +212,75 @@ class CloudStorage
       error "Failed to read file: #{fname}"
 
     options.mimetype or= mimetypes.guess fname
-    options.key or= fname
-    @put_file_string bucket, data, options
+    key = options.key or fname
+    @put_file_string bucket, key, data, options
+
+  copy_file: (source_bucket, source_key, dest_bucket, dest_key, options={}) =>
+    @_put "/#{dest_bucket}/#{url.escape dest_key}", "", extend {
+      "Content-length": "0"
+      "x-goog-copy-source": "/#{source_bucket}/#{source_key}"
+      "x-goog-acl": options.acl or "public-read"
+    }, options.headers
+
+  compose: (bucket, key, source_keys, options={}) =>
+    assert type(source_keys) == "table" and next(source_keys), "invalid source keys"
+
+    payload_buffer = {"<ComposeRequest>"}
+    for key_obj in *source_keys
+      local name, generation, if_generation_match
+
+      if type(key_obj) == "table"
+        {:name, :generation, :if_generation_match}
+      else
+        name = key_obj
+
+      assert name, "missing source key name for compose"
+      table.insert payload_buffer, "<Component>"
+      table.insert payload_buffer, "<Name>#{xml_escape name}</Name>"
+
+      if generation
+        table.insert payload_buffer, "<Generation>#{xml_escape generation}</Generation>"
+
+      if if_generation_match
+        table.insert payload_buffer, "<IfGenerationMatch>#{xml_escape if_generation_match}</IfGenerationMatch>"
+
+      table.insert payload_buffer, "</Component>"
+
+    table.insert payload_buffer, "</ComposeRequest>"
+
+    payload = table.concat payload_buffer
+
+    @_put "/#{bucket}/#{url.escape key}?compose", payload, extend {
+      "Content-length": #payload
+      "x-goog-acl": options.acl or "public-read"
+      "Content-type": options.mimetype
+    }, options.headers
+
+  start_resumable_upload: (bucket, key, options={}) =>
+    assert bucket, "missing bucket"
+    assert key, "missing key"
+
+    if type(key) == "table"
+      options = key
+      key = assert options.key, "missing key"
+
+    @_post "/#{bucket}/#{url.escape key}", "", extend {
+      "Content-type": options.mimetype
+      "Content-length": 0
+      "x-goog-acl": options.acl or "public-read"
+      "x-goog-resumable": "start"
+    }, options.headers
+
+  canonicalize_headers: (headers) =>
+    header_pairs = [{k\lower!,v} for k, v in pairs headers]
+    -- only count custom headers (x-goog), omit secret encryption headers
+    header_pairs = [e for e in *header_pairs when (e[1]\match("x%-goog.*") and not e[1]\match("x%-goog%-encryption%-key.*"))]
+
+    table.sort header_pairs, (a, b) ->
+      a[1] < b[1]
+    -- replace folding whitespace with spaces
+    values = [e[1] .. ":" .. e[2]\gsub("\r?\n", " ") for e in *header_pairs]
+    return concat values, "\n"
 
   encode_and_sign_policy: (expiration, conditions) =>
     if type(expiration) == "number"
@@ -180,24 +290,28 @@ class CloudStorage
     doc, @oauth\sign_string doc
 
   -- expiration: unix timestamp in UTC
-  signed_url: (bucket, key, expiration) =>
-    -- firefox chokes on [ ] in urls so we handle them ahead of time here
-    key = key\gsub "[%[%]]", {
-      "[": "%5B"
-      "]": "%5D"
-    }
+  signed_url: (bucket, key, expiration, opts={}) =>
+    key = url_encode_key key
 
     path = "/#{bucket}/#{key}"
     expiration = tostring expiration
 
-    str = concat {
-      "GET" -- verb
+    verb = opts.verb or "GET"
+
+    elements = {
+      verb
       "" -- md5
       "" -- content-type
       expiration
-      "" -- trailing newline
-    }, "\n"
+    }
 
+    -- 'As Needed', not required
+    if opts.headers and next opts.headers
+      table.insert elements, @canonicalize_headers(opts.headers)
+
+    table.insert elements, "" -- trailing newline
+
+    str = concat elements, "\n"
     str ..= path
 
     signature = @oauth\sign_string str
@@ -216,5 +330,50 @@ class CloudStorage
       "&Signature=", escape signature
     }
 
-{ :CloudStorage, :Bucket }
+  upload_url: (bucket, key, opts={}) =>
+    {
+      :content_disposition, :filename, :acl, :success_action_redirect,
+      :expires, :size_limit
+    } = opts
 
+    expires or= os.time! + 60^2
+    acl or= "project-private"
+
+    if filename
+      content_disposition or= "attachment"
+      filename_quoted = filename\gsub '"', "\\%1"
+      content_disposition ..= "; filename=\"#{filename_quoted}\""
+
+    policy = {}
+    insert policy, { :acl }
+    insert policy, { :bucket }
+    insert policy, {"eq", "$key", key}
+
+    if content_disposition
+      insert policy, {"eq", "$Content-Disposition", content_disposition}
+
+    if size_limit
+      insert policy, {"content-length-range", 0, size_limit}
+
+    if success_action_redirect
+      insert policy, { :success_action_redirect }
+
+    policy, signature = @encode_and_sign_policy expires, policy
+
+    action = @bucket_url bucket, subdomain: true
+
+    unless opts.https == false
+      action = action\gsub("http:", "https:") or action
+
+    params = {
+      :acl, :policy, :signature, :key
+      :success_action_redirect
+
+      "Content-Disposition": content_disposition
+      GoogleAccessId: @oauth.client_email
+    }
+
+    action, params
+
+
+{ :CloudStorage, :Bucket, :url_encode_key }

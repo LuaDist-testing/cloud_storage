@@ -10,6 +10,12 @@ do
   local _obj_0 = table
   insert, concat = _obj_0.insert, _obj_0.concat
 end
+local url_encode_key
+url_encode_key = function(key)
+  return (key:gsub([==[[%[%]#!%^%*%(%)"'%%]]==], function(c)
+    return "%" .. tostring(("%x"):format(c:byte()):upper())
+  end))
+end
 local extend
 extend = function(t, ...)
   local _list_0 = {
@@ -25,8 +31,42 @@ extend = function(t, ...)
   end
   return t
 end
+local xml_escape
+do
+  local punct = "[%^$()%.%[%]*+%-?]"
+  local escape_patt
+  escape_patt = function(str)
+    return (str:gsub(punct, function(p)
+      return "%" .. p
+    end))
+  end
+  local xml_escape_entities = {
+    ['&'] = '&amp;',
+    ['<'] = '&lt;',
+    ['>'] = '&gt;',
+    ['"'] = '&quot;',
+    ["'"] = '&#039;'
+  }
+  local xml_unescape_entities = { }
+  for key, value in pairs(xml_escape_entities) do
+    xml_unescape_entities[value] = key
+  end
+  local xml_escape_pattern = "[" .. concat((function()
+    local _accum_0 = { }
+    local _len_0 = 1
+    for char in pairs(xml_escape_entities) do
+      _accum_0[_len_0] = escape_patt(char)
+      _len_0 = _len_0 + 1
+    end
+    return _accum_0
+  end)()) .. "]"
+  xml_escape = function(text)
+    return (text:gsub(xml_escape_pattern, xml_escape_entities))
+  end
+end
 local LOMFormatter
 do
+  local _class_0
   local find_node, filter_nodes, node_value
   local _base_0 = {
     format = function(self, res, code, headers)
@@ -89,7 +129,7 @@ do
     end
   }
   _base_0.__index = _base_0
-  local _class_0 = setmetatable({
+  _class_0 = setmetatable({
     __init = function(self)
       self.lom = require("lxp.lom")
     end,
@@ -145,10 +185,11 @@ do
 end
 local Bucket
 do
+  local _class_0
   local forward_methods
   local _base_0 = { }
   _base_0.__index = _base_0
-  local _class_0 = setmetatable({
+  _class_0 = setmetatable({
     __init = function(self, bucket_name, storage)
       self.bucket_name, self.storage = bucket_name, storage
     end,
@@ -188,8 +229,10 @@ do
 end
 local CloudStorage
 do
+  local _class_0
   local _base_0 = {
     url_base = "commondatastorage.googleapis.com",
+    api_base = "storage.googleapis.com",
     _headers = function(self)
       return {
         ["x-goog-api-version"] = 2,
@@ -205,18 +248,20 @@ do
       local http = h.get()
       local out = { }
       local r = {
-        url = url.build({
-          scheme = "https",
-          host = "storage.googleapis.com",
-          path = path
-        }),
+        url = "https://" .. tostring(self.api_base) .. tostring(path),
         source = data and ltn12.source.string(data),
         method = method,
         headers = extend(self:_headers(), headers),
         sink = ltn12.sink.table(out)
       }
       local _, code, res_headers = http.request(r)
-      return self.formatter:format(table.concat(out), code, res_headers)
+      local res
+      res, code = self.formatter:format(table.concat(out), code, res_headers)
+      if type(res) == "table" and res.error then
+        return nil, tostring(res.message) .. " " .. tostring(res.details), res
+      else
+        return res, code
+      end
     end,
     bucket = function(self, bucket)
       return Bucket(bucket, self)
@@ -242,26 +287,31 @@ do
       return self:_get("/" .. tostring(bucket))
     end,
     get_file = function(self, bucket, key)
-      return self:_get("/" .. tostring(bucket) .. "/" .. tostring(key))
+      return self:_get("/" .. tostring(bucket) .. "/" .. tostring(url.escape(key)))
     end,
     delete_file = function(self, bucket, key)
-      return self:_delete("/" .. tostring(bucket) .. "/" .. tostring(key))
+      return self:_delete("/" .. tostring(bucket) .. "/" .. tostring(url.escape(key)))
     end,
     head_file = function(self, bucket, key)
-      return self:_head("/" .. tostring(bucket) .. "/" .. tostring(key))
+      return self:_head("/" .. tostring(bucket) .. "/" .. tostring(url.escape(key)))
     end,
     put_file_acl = function(self, bucket, key, acl)
-      error("broken")
-      return self:_put("/" .. tostring(bucket) .. "/" .. tostring(key) .. "?acl", "", {
+      return self:_put("/" .. tostring(bucket) .. "/" .. tostring(url.escape(key)) .. "?acl", "", {
         ["Content-length"] = 0,
         ["x-goog-acl"] = acl
       })
     end,
-    put_file_string = function(self, bucket, data, options)
+    put_file_string = function(self, bucket, key, data, options)
       if options == nil then
         options = { }
       end
-      return self:_put("/" .. tostring(bucket) .. "/" .. tostring(options.key), data, extend({
+      assert(not options.key, "key is not an option, but an argument")
+      if type(data) == "table" then
+        error("put_file_string interface has changed: key is now the second argument")
+      end
+      assert(key, "missing key")
+      assert(type(data) == "string", "expected string for data")
+      return self:_put("/" .. tostring(bucket) .. "/" .. tostring(key), data, extend({
         ["Content-length"] = #data,
         ["Content-type"] = options.mimetype,
         ["x-goog-acl"] = options.acl or "public-read"
@@ -285,8 +335,116 @@ do
         end
       end
       options.mimetype = options.mimetype or mimetypes.guess(fname)
-      options.key = options.key or fname
-      return self:put_file_string(bucket, data, options)
+      local key = options.key or fname
+      return self:put_file_string(bucket, key, data, options)
+    end,
+    copy_file = function(self, source_bucket, source_key, dest_bucket, dest_key, options)
+      if options == nil then
+        options = { }
+      end
+      return self:_put("/" .. tostring(dest_bucket) .. "/" .. tostring(url.escape(dest_key)), "", extend({
+        ["Content-length"] = "0",
+        ["x-goog-copy-source"] = "/" .. tostring(source_bucket) .. "/" .. tostring(source_key),
+        ["x-goog-acl"] = options.acl or "public-read"
+      }, options.headers))
+    end,
+    compose = function(self, bucket, key, source_keys, options)
+      if options == nil then
+        options = { }
+      end
+      assert(type(source_keys) == "table" and next(source_keys), "invalid source keys")
+      local payload_buffer = {
+        "<ComposeRequest>"
+      }
+      for _index_0 = 1, #source_keys do
+        local key_obj = source_keys[_index_0]
+        local name, generation, if_generation_match
+        if type(key_obj) == "table" then
+          local _ = {
+            name = name,
+            generation = generation,
+            if_generation_match = if_generation_match
+          }
+        else
+          name = key_obj
+        end
+        assert(name, "missing source key name for compose")
+        table.insert(payload_buffer, "<Component>")
+        table.insert(payload_buffer, "<Name>" .. tostring(xml_escape(name)) .. "</Name>")
+        if generation then
+          table.insert(payload_buffer, "<Generation>" .. tostring(xml_escape(generation)) .. "</Generation>")
+        end
+        if if_generation_match then
+          table.insert(payload_buffer, "<IfGenerationMatch>" .. tostring(xml_escape(if_generation_match)) .. "</IfGenerationMatch>")
+        end
+        table.insert(payload_buffer, "</Component>")
+      end
+      table.insert(payload_buffer, "</ComposeRequest>")
+      local payload = table.concat(payload_buffer)
+      return self:_put("/" .. tostring(bucket) .. "/" .. tostring(url.escape(key)) .. "?compose", payload, extend({
+        ["Content-length"] = #payload,
+        ["x-goog-acl"] = options.acl or "public-read",
+        ["Content-type"] = options.mimetype
+      }, options.headers))
+    end,
+    start_resumable_upload = function(self, bucket, key, options)
+      if options == nil then
+        options = { }
+      end
+      assert(bucket, "missing bucket")
+      assert(key, "missing key")
+      if type(key) == "table" then
+        options = key
+        key = assert(options.key, "missing key")
+      end
+      return self:_post("/" .. tostring(bucket) .. "/" .. tostring(url.escape(key)), "", extend({
+        ["Content-type"] = options.mimetype,
+        ["Content-length"] = 0,
+        ["x-goog-acl"] = options.acl or "public-read",
+        ["x-goog-resumable"] = "start"
+      }, options.headers))
+    end,
+    canonicalize_headers = function(self, headers)
+      local header_pairs
+      do
+        local _accum_0 = { }
+        local _len_0 = 1
+        for k, v in pairs(headers) do
+          _accum_0[_len_0] = {
+            k:lower(),
+            v
+          }
+          _len_0 = _len_0 + 1
+        end
+        header_pairs = _accum_0
+      end
+      do
+        local _accum_0 = { }
+        local _len_0 = 1
+        for _index_0 = 1, #header_pairs do
+          local e = header_pairs[_index_0]
+          if (e[1]:match("x%-goog.*") and not e[1]:match("x%-goog%-encryption%-key.*")) then
+            _accum_0[_len_0] = e
+            _len_0 = _len_0 + 1
+          end
+        end
+        header_pairs = _accum_0
+      end
+      table.sort(header_pairs, function(a, b)
+        return a[1] < b[1]
+      end)
+      local values
+      do
+        local _accum_0 = { }
+        local _len_0 = 1
+        for _index_0 = 1, #header_pairs do
+          local e = header_pairs[_index_0]
+          _accum_0[_len_0] = e[1] .. ":" .. e[2]:gsub("\r?\n", " ")
+          _len_0 = _len_0 + 1
+        end
+        values = _accum_0
+      end
+      return concat(values, "\n")
     end,
     encode_and_sign_policy = function(self, expiration, conditions)
       if type(expiration) == "number" then
@@ -298,20 +456,25 @@ do
       }))
       return doc, self.oauth:sign_string(doc)
     end,
-    signed_url = function(self, bucket, key, expiration)
-      key = key:gsub("[%[%]]", {
-        ["["] = "%5B",
-        ["]"] = "%5D"
-      })
+    signed_url = function(self, bucket, key, expiration, opts)
+      if opts == nil then
+        opts = { }
+      end
+      key = url_encode_key(key)
       local path = "/" .. tostring(bucket) .. "/" .. tostring(key)
       expiration = tostring(expiration)
-      local str = concat({
-        "GET",
+      local verb = opts.verb or "GET"
+      local elements = {
+        verb,
         "",
         "",
-        expiration,
-        ""
-      }, "\n")
+        expiration
+      }
+      if opts.headers and next(opts.headers) then
+        table.insert(elements, self:canonicalize_headers(opts.headers))
+      end
+      table.insert(elements, "")
+      local str = concat(elements, "\n")
       str = str .. path
       local signature = self.oauth:sign_string(str)
       local escape
@@ -331,10 +494,73 @@ do
         "&Signature=",
         escape(signature)
       })
+    end,
+    upload_url = function(self, bucket, key, opts)
+      if opts == nil then
+        opts = { }
+      end
+      local content_disposition, filename, acl, success_action_redirect, expires, size_limit
+      content_disposition, filename, acl, success_action_redirect, expires, size_limit = opts.content_disposition, opts.filename, opts.acl, opts.success_action_redirect, opts.expires, opts.size_limit
+      expires = expires or (os.time() + 60 ^ 2)
+      acl = acl or "project-private"
+      if filename then
+        content_disposition = content_disposition or "attachment"
+        local filename_quoted = filename:gsub('"', "\\%1")
+        content_disposition = content_disposition .. "; filename=\"" .. tostring(filename_quoted) .. "\""
+      end
+      local policy = { }
+      insert(policy, {
+        acl = acl
+      })
+      insert(policy, {
+        bucket = bucket
+      })
+      insert(policy, {
+        "eq",
+        "$key",
+        key
+      })
+      if content_disposition then
+        insert(policy, {
+          "eq",
+          "$Content-Disposition",
+          content_disposition
+        })
+      end
+      if size_limit then
+        insert(policy, {
+          "content-length-range",
+          0,
+          size_limit
+        })
+      end
+      if success_action_redirect then
+        insert(policy, {
+          success_action_redirect = success_action_redirect
+        })
+      end
+      local signature
+      policy, signature = self:encode_and_sign_policy(expires, policy)
+      local action = self:bucket_url(bucket, {
+        subdomain = true
+      })
+      if not (opts.https == false) then
+        action = action:gsub("http:", "https:") or action
+      end
+      local params = {
+        acl = acl,
+        policy = policy,
+        signature = signature,
+        key = key,
+        success_action_redirect = success_action_redirect,
+        ["Content-Disposition"] = content_disposition,
+        GoogleAccessId = self.oauth.client_email
+      }
+      return action, params
     end
   }
   _base_0.__index = _base_0
-  local _class_0 = setmetatable({
+  _class_0 = setmetatable({
     __init = function(self, oauth, project_id)
       self.oauth, self.project_id = oauth, project_id
       self.formatter = LOMFormatter()
@@ -351,6 +577,16 @@ do
   })
   _base_0.__class = _class_0
   local self = _class_0
+  self.from_json_key_file = function(self, file)
+    local file_contents = assert(assert(io.open(file)):read("*a"))
+    json = require("cjson")
+    local obj = assert(json.decode(file_contents))
+    local OAuth
+    OAuth = require("cloud_storage.oauth").OAuth
+    local oauth = OAuth(obj.client_email)
+    oauth:_load_private_key(obj.private_key)
+    return CloudStorage(oauth, obj.client_id)
+  end
   local _list_0 = {
     "GET",
     "POST",
@@ -368,5 +604,6 @@ do
 end
 return {
   CloudStorage = CloudStorage,
-  Bucket = Bucket
+  Bucket = Bucket,
+  url_encode_key = url_encode_key
 }

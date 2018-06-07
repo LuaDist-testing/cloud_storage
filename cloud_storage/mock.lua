@@ -1,8 +1,5 @@
 local Bucket
-do
-  local _obj_0 = require("cloud_storage.google")
-  Bucket = _obj_0.Bucket
-end
+Bucket = require("cloud_storage.google").Bucket
 local execute
 execute = function(cmd)
   local proc = io.popen(cmd)
@@ -12,6 +9,7 @@ execute = function(cmd)
 end
 local MockStorage
 do
+  local _class_0
   local _base_0 = {
     bucket = function(self, bucket)
       return Bucket(bucket, self)
@@ -104,7 +102,7 @@ do
     end
   }
   _base_0.__index = _base_0
-  local _class_0 = setmetatable({
+  _class_0 = setmetatable({
     __init = function(self, dir_name, url_prefix)
       if dir_name == nil then
         dir_name = "."
@@ -128,7 +126,7 @@ do
   MockStorage = _class_0
 end
 if ... == "test" then
-  require("moon")
+  local moon = require("moon")
   local s = MockStorage("test_storage", "static")
   print(s:_full_path("dad_bucket", "eat/my/sucks"))
   print(MockStorage():_full_path("nobucket", "hello.world"))
